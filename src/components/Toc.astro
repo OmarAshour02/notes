@@ -1,0 +1,38 @@
+---
+type Heading = { depth: number; slug: string; text: string };
+type Props = { headings: Heading[] };
+
+function toRoman(n: number): string {
+  const map: [number, string][] = [
+    [10, "X"], [9, "IX"], [5, "V"], [4, "IV"], [1, "I"],
+  ];
+  let out = "";
+  for (const [v, s] of map) {
+    while (n >= v) { out += s; n -= v; }
+  }
+  return out;
+}
+
+const { headings } = Astro.props;
+const items = headings.filter((h) => h.depth === 2 || h.depth === 3);
+
+let h2Counter = 0;
+const numbered = items.map((h) => {
+  if (h.depth === 2) h2Counter += 1;
+  return { ...h, numeral: h.depth === 2 ? toRoman(h2Counter) : "" };
+});
+---
+
+{items.length > 0 && (
+  <nav class="toc" aria-label="Table of contents">
+    <p class="toc-label">Contents</p>
+    <ol class="toc-list">
+      {numbered.map((h) => (
+        <li class={`toc-item depth-${h.depth}`}>
+          {h.numeral && <span class="toc-num">{h.numeral}</span>}
+          <a href={`#${h.slug}`}>{h.text}</a>
+        </li>
+      ))}
+    </ol>
+  </nav>
+)}

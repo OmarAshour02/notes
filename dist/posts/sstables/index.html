@@ -1,0 +1,753 @@
+<!DOCTYPE html><html lang="en"> <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="Two storage engines power most of the databases you've used. One is a tree of pages, updated in place. The other is a stack of immutable files, merged in the background. We will build both, badly, and see what each one costs."><link rel="icon" type="image/svg+xml" href="/favicon.svg"><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Playfair+Display:ital,wght@0,500;0,600;0,700;1,500&display=swap" rel="stylesheet"><title>How databases store data: from a bash log to a B-tree</title><link rel="stylesheet" href="/_astro/_slug_.DbRNyIvH.css"></head> <body>  <a class="back-btn" href="/" aria-label="Back to index">←</a> <nav class="toc" aria-label="Table of contents"><p class="toc-label">Contents</p><ol class="toc-list"><li class="toc-item depth-2"><span class="toc-num">I</span><a href="#the-simplest-database-in-the-world">The simplest database in the world</a></li><li class="toc-item depth-2"><span class="toc-num">II</span><a href="#from-a-log-to-a-sorted-file">From a log to a sorted file</a></li><li class="toc-item depth-2"><span class="toc-num">III</span><a href="#bloom-filters-skipping-files-we-do-not-need-to-read">Bloom filters: skipping files we do not need to read</a></li><li class="toc-item depth-2"><span class="toc-num">IV</span><a href="#compaction-paying-the-bill">Compaction: paying the bill</a></li><li class="toc-item depth-2"><span class="toc-num">V</span><a href="#the-full-picture">The full picture</a></li><li class="toc-item depth-2"><span class="toc-num">VI</span><a href="#the-other-school-b-trees">The other school: B-trees</a></li><li class="toc-item depth-2"><span class="toc-num">VII</span><a href="#lsm-trees-vs-b-trees-the-trade-offs">LSM-trees vs B-trees: the trade-offs</a></li><li class="toc-item depth-2"><span class="toc-num">VIII</span><a href="#why-this-matters">Why this matters</a></li></ol></nav> <article class="article"> <header class="article-header"> <span class="note-id">Note № 0001</span> <p class="filed-under"> <span class="label">Filed under</span>  <span class="sep">·</span> <span class="tag">storage</span>  <span class="sep">·</span> <span class="tag">lsm-trees</span>  <span class="sep">·</span> <span class="tag">b-trees</span>  <span class="sep">·</span> <span class="tag">databases</span>  </p> <h1 class="article-title"> <span class="accent">H</span> ow databases store data: from a bash log to a B-tree </h1> <p class="article-subtitle">Two storage engines power most of the databases you&#39;ve used. One is a tree of pages, updated in place. The other is a stack of immutable files, merged in the background. We will build both, badly, and see what each one costs.</p> <p class="article-meta"> <span class="author">Omar Ashour</span> <span class="dot">·</span> <span>25 min read</span> </p> </header> <figure class="article-hero"> <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/b/b1/Antonello_da_Messina_-_St_Jerome_in_his_study_-_National_Gallery_London.jpg/1280px-Antonello_da_Messina_-_St_Jerome_in_his_study_-_National_Gallery_London.jpg" alt="Antonello da Messina, Saint Jerome in His Study" loading="eager"> <figcaption>Antonello da Messina, Saint Jerome in His Study (c. 1475). Every storage engine is a way of keeping the shelves in order.</figcaption> </figure> <div class="prose">  <p>A database has two jobs. Take a write and not lose it. Take a read and answer fast. Most engines pick one of two ways to do this.</p>
+<p>One way is to keep a tree on disk and update it in place. The other way is to write everything to a fresh file and never go back. Both work. Both ship at scale. They are good at different things.</p>
+<blockquote>
+<p><strong>The crux:</strong> how do you build a key-value store that is fast to write and still sane to read?</p>
+</blockquote>
+<p>We will start with the simplest database in the world. Two lines of bash. Then we will watch it fall over, and rebuild it: better files, smaller indexes, smarter merges. By the end you will know why your database makes the choice it makes.</p>
+<h2 id="the-simplest-database-in-the-world">The simplest database in the world</h2>
+<p>Open any Unix shell. You can write a database in two functions:</p>
+<pre class="astro-code gruvbox-material-dark" style="background-color:#282828;color:#d4be98;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="sh"><code><span class="line"><span style="color:#A9B665">db_set</span><span style="color:#D4BE98"> () { </span><span style="color:#A9B665">echo</span><span style="color:#D4BE98"> &quot;$1</span><span style="color:#A9B665">,</span><span style="color:#D4BE98">$2&quot;</span><span style="color:#E78A4E"> &gt;&gt;</span><span style="color:#A9B665"> database</span><span style="color:#D4BE98">; }</span></span>
+<span class="line"><span style="color:#A9B665">db_get</span><span style="color:#D4BE98"> () { </span><span style="color:#A9B665">grep</span><span style="color:#D4BE98"> &quot;</span><span style="color:#A9B665">^</span><span style="color:#D4BE98">$1</span><span style="color:#A9B665">,</span><span style="color:#D4BE98">&quot;</span><span style="color:#A9B665"> database</span><span style="color:#E78A4E"> |</span><span style="color:#A9B665"> tail</span><span style="color:#D3869B"> -n</span><span style="color:#D3869B"> 1</span><span style="color:#D4BE98">; }</span></span>
+<span class="line"></span></code></pre>
+<p>That is it. Writes append a line. Reads grep for the key and take the last match. The “newest write wins” rule is hidden in that <code>tail -n 1</code>.</p>
+<aside class="sidenote"> <p>This is straight from chapter 3 of <em>Designing Data-Intensive Applications</em> by Martin Kleppmann. The whole post owes a lot to that chapter.</p> </aside>
+<p>Try it:</p>
+<style>astro-island,astro-slot,astro-static-slot{display:contents}</style><script>(()=>{var e=async t=>{await(await t())()};(self.Astro||(self.Astro={})).load=e;window.dispatchEvent(new Event("astro:load"));})();;(()=>{var A=Object.defineProperty;var g=(i,o,a)=>o in i?A(i,o,{enumerable:!0,configurable:!0,writable:!0,value:a}):i[o]=a;var d=(i,o,a)=>g(i,typeof o!="symbol"?o+"":o,a);{let i={0:t=>m(t),1:t=>a(t),2:t=>new RegExp(t),3:t=>new Date(t),4:t=>new Map(a(t)),5:t=>new Set(a(t)),6:t=>BigInt(t),7:t=>new URL(t),8:t=>new Uint8Array(t),9:t=>new Uint16Array(t),10:t=>new Uint32Array(t),11:t=>1/0*t},o=t=>{let[l,e]=t;return l in i?i[l](e):void 0},a=t=>t.map(o),m=t=>typeof t!="object"||t===null?t:Object.fromEntries(Object.entries(t).map(([l,e])=>[l,o(e)]));class y extends HTMLElement{constructor(){super(...arguments);d(this,"Component");d(this,"hydrator");d(this,"hydrate",async()=>{var b;if(!this.hydrator||!this.isConnected)return;let e=(b=this.parentElement)==null?void 0:b.closest("astro-island[ssr]");if(e){e.addEventListener("astro:hydrate",this.hydrate,{once:!0});return}let c=this.querySelectorAll("astro-slot"),n={},h=this.querySelectorAll("template[data-astro-template]");for(let r of h){let s=r.closest(this.tagName);s!=null&&s.isSameNode(this)&&(n[r.getAttribute("data-astro-template")||"default"]=r.innerHTML,r.remove())}for(let r of c){let s=r.closest(this.tagName);s!=null&&s.isSameNode(this)&&(n[r.getAttribute("name")||"default"]=r.innerHTML)}let p;try{p=this.hasAttribute("props")?m(JSON.parse(this.getAttribute("props"))):{}}catch(r){let s=this.getAttribute("component-url")||"<unknown>",v=this.getAttribute("component-export");throw v&&(s+=` (export ${v})`),console.error(`[hydrate] Error parsing props for component ${s}`,this.getAttribute("props"),r),r}let u;await this.hydrator(this)(this.Component,p,n,{client:this.getAttribute("client")}),this.removeAttribute("ssr"),this.dispatchEvent(new CustomEvent("astro:hydrate"))});d(this,"unmount",()=>{this.isConnected||this.dispatchEvent(new CustomEvent("astro:unmount"))})}disconnectedCallback(){document.removeEventListener("astro:after-swap",this.unmount),document.addEventListener("astro:after-swap",this.unmount,{once:!0})}connectedCallback(){if(!this.hasAttribute("await-children")||document.readyState==="interactive"||document.readyState==="complete")this.childrenConnectedCallback();else{let e=()=>{document.removeEventListener("DOMContentLoaded",e),c.disconnect(),this.childrenConnectedCallback()},c=new MutationObserver(()=>{var n;((n=this.lastChild)==null?void 0:n.nodeType)===Node.COMMENT_NODE&&this.lastChild.nodeValue==="astro:end"&&(this.lastChild.remove(),e())});c.observe(this,{childList:!0}),document.addEventListener("DOMContentLoaded",e)}}async childrenConnectedCallback(){let e=this.getAttribute("before-hydration-url");e&&await import(e),this.start()}async start(){let e=JSON.parse(this.getAttribute("opts")),c=this.getAttribute("client");if(Astro[c]===void 0){window.addEventListener(`astro:${c}`,()=>this.start(),{once:!0});return}try{await Astro[c](async()=>{let n=this.getAttribute("renderer-url"),[h,{default:p}]=await Promise.all([import(this.getAttribute("component-url")),n?import(n):()=>()=>{}]),u=this.getAttribute("component-export")||"default";if(!u.includes("."))this.Component=h[u];else{this.Component=h;for(let f of u.split("."))this.Component=this.Component[f]}return this.hydrator=p,this.hydrate},e,this)}catch(n){console.error(`[astro-island] Error hydrating ${this.getAttribute("component-url")}`,n)}}attributeChangedCallback(){this.hydrate()}}d(y,"observedAttributes",["props"]),customElements.get("astro-island")||customElements.define("astro-island",y)}})();</script><astro-island uid="Z1b2eDj" prefix="r0" component-url="/_astro/BashShellDemo.st_lidDR.js" component-export="default" renderer-url="/_astro/client.BuOr9PT5.js" props="{}" ssr="" client="load" opts="{&quot;name&quot;:&quot;BashShellDemo&quot;,&quot;value&quot;:true}" await-children=""><div class="sh"><div class="sh-pane"><header class="sh-head"><span class="sh-dot sh-dot-r"></span><span class="sh-dot sh-dot-y"></span><span class="sh-dot sh-dot-g"></span><span class="sh-title">~ / db.sh</span></header><div class="sh-screen"><div class="sh-line sh-out "> </div><div class="sh-line sh-out sh-tone-info">try:
+·db_set 42 cat   
+·db_set 42 dog   
+·db_get 42</div></div><form class="sh-form"><span class="sh-prompt">$</span><input class="sh-cmd" placeholder="db_set 42 cat" autoComplete="off" spellcheck="false" value=""/></form><div class="sh-quick"><button type="button" class="sh-chip">db_set 42 cat</button><button type="button" class="sh-chip">db_set 42 dog</button><button type="button" class="sh-chip">db_get 42</button><button type="button" class="sh-chip">cat database</button><button type="button" class="sh-chip">reset</button></div></div><aside class="sh-side"><header class="sh-side-head"><h4>database</h4><span>0<!-- --> line<!-- -->s</span></header><p class="sh-empty">empty file. run <code>db_set</code> to append a line.</p></aside><style>
+      .sh {
+        display: grid;
+        grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+        gap: 1rem;
+        font-family: var(--mono);
+        color: var(--fg);
+        background: var(--bg-soft);
+        border: 1px solid var(--bg2);
+        border-radius: 8px;
+        padding: 1rem;
+        margin: 2rem 0;
+      }
+      @media (max-width: 720px) {
+        .sh { grid-template-columns: 1fr; }
+      }
+
+      .sh-pane {
+        background: var(--bg);
+        border: 1px solid var(--bg2);
+        border-radius: 6px;
+        display: flex;
+        flex-direction: column;
+        min-height: 22rem;
+      }
+      .sh-head {
+        display: flex;
+        align-items: center;
+        gap: 0.4rem;
+        padding: 0.55rem 0.75rem;
+        border-bottom: 1px solid var(--bg2);
+      }
+      .sh-dot {
+        width: 10px; height: 10px; border-radius: 50%;
+        display: inline-block;
+      }
+      .sh-dot-r { background: var(--red); }
+      .sh-dot-y { background: var(--yellow); }
+      .sh-dot-g { background: var(--green); }
+      .sh-title {
+        margin-left: auto;
+        font-size: 0.78rem;
+        color: var(--gray);
+        letter-spacing: 0.06em;
+      }
+
+      .sh-screen {
+        flex: 1;
+        padding: 0.75rem 0.85rem;
+        overflow-y: auto;
+        font-size: 0.85rem;
+        line-height: 1.55;
+        max-height: 22rem;
+      }
+      .sh-line { white-space: pre-wrap; word-break: break-word; }
+      .sh-input { color: var(--fg-dim); }
+      .sh-prompt { color: var(--green); margin-right: 0.4em; }
+      .sh-out { color: var(--fg-soft); }
+      .sh-tone-ok { color: var(--aqua); }
+      .sh-tone-warn { color: var(--orange); }
+      .sh-tone-info { color: var(--gray); font-style: italic; }
+
+      .sh-form {
+        display: flex;
+        align-items: center;
+        gap: 0.4rem;
+        padding: 0.5rem 0.85rem;
+        border-top: 1px solid var(--bg2);
+      }
+      .sh-cmd {
+        flex: 1;
+        background: transparent;
+        border: none;
+        outline: none;
+        color: var(--fg);
+        font-family: var(--mono);
+        font-size: 0.9rem;
+        padding: 0.2rem 0;
+      }
+      .sh-cmd::placeholder { color: var(--bg3); }
+
+      .sh-quick {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.35rem;
+        padding: 0 0.6rem 0.6rem;
+      }
+      .sh-chip {
+        background: var(--bg);
+        color: var(--fg-soft);
+        border: 1px solid var(--bg2);
+        border-radius: 999px;
+        padding: 0.22rem 0.65rem;
+        font-family: var(--mono);
+        font-size: 0.75rem;
+        cursor: pointer;
+        transition: color 100ms, border-color 100ms;
+      }
+      .sh-chip:hover { color: var(--yellow); border-color: var(--yellow); }
+
+      .sh-side {
+        background: var(--bg);
+        border: 1px solid var(--bg2);
+        border-radius: 6px;
+        padding: 0.85rem 0.95rem;
+        display: flex;
+        flex-direction: column;
+        min-height: 22rem;
+      }
+      .sh-side-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+        margin-bottom: 0.55rem;
+      }
+      .sh-side-head h4 {
+        margin: 0;
+        font-size: 0.82rem;
+        color: var(--yellow);
+        letter-spacing: 0.05em;
+      }
+      .sh-side-head span {
+        font-size: 0.72rem;
+        color: var(--gray);
+      }
+
+      .sh-empty {
+        color: var(--gray); font-style: italic; margin: 0;
+        font-size: 0.85rem;
+      }
+      .sh-log {
+        list-style: none; padding: 0; margin: 0;
+        font-size: 0.85rem;
+        flex: 1;
+        overflow-y: auto;
+        max-height: 18rem;
+      }
+      .sh-log li {
+        display: flex;
+        gap: 0.6rem;
+        align-items: baseline;
+        padding: 0.18rem 0;
+        border-bottom: 1px dashed var(--bg2);
+      }
+      .sh-ln {
+        color: var(--gray);
+        font-size: 0.72rem;
+        min-width: 1.6em;
+        text-align: right;
+      }
+      .sh-pair { color: var(--fg); }
+      .sh-k { color: var(--blue); }
+      .sh-comma { color: var(--gray); margin: 0 0.15em; }
+      .sh-v { color: var(--fg); }
+
+      .sh-meter {
+        margin: 0.6rem 0 0;
+        padding-top: 0.6rem;
+        border-top: 1px solid var(--bg2);
+        color: var(--fg-soft);
+        font-size: 0.78rem;
+      }
+      .sh-meter strong { color: var(--orange); font-weight: 600; }
+      .sh-meter code {
+        background: var(--bg-soft);
+        color: var(--aqua);
+        padding: 0.05em 0.35em;
+        border-radius: 3px;
+        font-size: 0.85em;
+      }
+    </style></div><!--astro:end--></astro-island>
+<p>Run <code>db_set 42 cat</code>, then <code>db_set 42 dog</code>, then <code>db_get 42</code>. The new value wins because we always take the last line. Now run a few more <code>db_set</code>s. Run a <code>db_get</code> for a key you have never written. Watch the line counter on the right.</p>
+<p>Two things stand out.</p>
+<p>Writes are very fast. They are just an append. The disk head, if you have one, never has to seek.</p>
+<p>Reads are awful. Every <code>db_get</code> walks the whole file. With ten lines that is fine. With ten million it is the only thing you do all day.</p>
+<p>The fix is not to throw away the log. The log is a great thing. The fix is to add an index that tells us where to look.</p>
+<aside class="sidenote"> <p>This is what <em>Bitcask</em> does. Bitcask keeps a hash map in memory: every key points to the byte offset of its latest value in the log. Reads become one disk seek. Writes are still appends. The catch is that the hash map must fit in RAM, and you cannot do range scans.</p> </aside>
+<h2 id="from-a-log-to-a-sorted-file">From a log to a sorted file</h2>
+<p>A hash index is a fine answer if all your keys fit in memory. They often do not. So we want an index that scales further, and that supports range scans, which a hash map does not.</p>
+<p>Here is the trick. What if the file on disk were sorted by key?</p>
+<p>Then we do not need an entry per key. We can keep a <em>sparse</em> index: every hundredth key, with its byte offset. To find a key, we binary-search the sparse index, jump to the right region, and scan a little. The index is small enough to keep in memory even for huge files.</p>
+<p>This sorted-on-disk file has a name in the literature: an <strong>SSTable</strong>, for <em>Sorted String Table</em>. It first appeared in Google’s Bigtable paper in 2006. Cassandra, RocksDB, LevelDB, and ScyllaDB are all built on it.</p>
+<aside class="sidenote"> <p>SSTables are also nice because two of them can be merged into one in linear time, with the same merge step from mergesort. We will use this in a minute.</p> </aside>
+<p>An SSTable is, in spirit, three things:</p>
+<ul>
+<li>A sorted sequence of <code>(key, value)</code> records.</li>
+<li>A sparse index pointing into that sequence.</li>
+<li>A bloom filter that can cheaply say “this key is definitely <em>not</em> in this file.”</li>
+</ul>
+<p>The on-disk format has more details, like block compression, checksums, and a footer. But the contract is simple. It is an immutable, sorted file you can binary-search and probe.</p>
+<p>But how do we get our data into a sorted file in the first place? Writes come in random order. We cannot keep them sorted as we go without paying a real cost.</p>
+<p>So databases cheat. They keep the most recent writes in memory, in a sorted structure called a <strong>memtable</strong> (usually a skip list or a red-black tree). Reads check the memtable first. When the memtable gets large enough, the database flushes it: writes its contents, in sorted order, to a fresh SSTable on disk, and starts a new empty memtable.</p>
+<aside class="sidenote"> <p>Skip lists are popular for memtables because they are friendly to concurrent writes and roughly as fast as a balanced tree, without the rotation bookkeeping.</p> </aside>
+<p>Old SSTables stay on disk. A <code>get</code> walks through them, newest first, until it finds the key, or a tombstone (a marker that says “this key is gone”). The newest write always wins.</p>
+<p>So now: a write is an in-memory insert plus a tiny append. A read is a memtable lookup, then a walk through some SSTables. There are still two questions to answer.</p>
+<p>First. When a read walks the SSTables, can we skip the ones that do not have the key? Yes. That is what the bloom filter is for.</p>
+<p>Second. If the stack of SSTables grows forever, reads get slow again. So how do we keep it small? That is what compaction is for.</p>
+<h2 id="bloom-filters-skipping-files-we-do-not-need-to-read">Bloom filters: skipping files we do not need to read</h2>
+<p>A bloom filter is a small piece of magic. It is an array of bits and a few hash functions. To insert a key, we hash it <code>k</code> ways and set those <code>k</code> bits to 1. To ask “is this key in the set?”, we hash again and check those <code>k</code> bits.</p>
+<p>If any of those bits is 0, the answer is <strong>no</strong>, for sure. If all are 1, the answer is <strong>maybe</strong>.</p>
+<astro-island uid="1Igef0" prefix="r1" component-url="/_astro/BloomFilterDemo.D5KgIkOJ.js" component-export="default" renderer-url="/_astro/client.BuOr9PT5.js" props="{}" ssr="" client="load" opts="{&quot;name&quot;:&quot;BloomFilterDemo&quot;,&quot;value&quot;:true}" await-children=""><div class="bf"><div class="bf-controls"><div class="bf-row"><input class="bf-input" placeholder="key to insert" value=""/><button class="bf-btn bf-btn-primary">insert</button></div><div class="bf-row"><input class="bf-input" placeholder="key to test" value=""/><button class="bf-btn">query</button><button class="bf-btn bf-btn-warn">reset</button></div><div class="bf-row bf-sliders"><label class="bf-slider"><span>m (bits): <strong>48</strong></span><input type="range" min="16" max="96" step="4" value="48"/></label><label class="bf-slider"><span>k (hashes): <strong>3</strong></span><input type="range" min="1" max="6" step="1" value="3"/></label></div><div class="bf-stats"><div class="bf-stat"><span class="bf-stat-label">inserted</span><span class="bf-stat-value">0</span></div><div class="bf-stat"><span class="bf-stat-label">bits set</span><span class="bf-stat-value">0 / 48</span></div><div class="bf-stat"><span class="bf-stat-label">theoretical false-positive</span><span class="bf-stat-value">0%</span></div></div></div><div class="bf-grid"><div class="bf-cell" title="bit 0: 0"><span class="bf-cell-i">0</span></div><div class="bf-cell" title="bit 1: 0"><span class="bf-cell-i">1</span></div><div class="bf-cell" title="bit 2: 0"><span class="bf-cell-i">2</span></div><div class="bf-cell" title="bit 3: 0"><span class="bf-cell-i">3</span></div><div class="bf-cell" title="bit 4: 0"><span class="bf-cell-i">4</span></div><div class="bf-cell" title="bit 5: 0"><span class="bf-cell-i">5</span></div><div class="bf-cell" title="bit 6: 0"><span class="bf-cell-i">6</span></div><div class="bf-cell" title="bit 7: 0"><span class="bf-cell-i">7</span></div><div class="bf-cell" title="bit 8: 0"><span class="bf-cell-i">8</span></div><div class="bf-cell" title="bit 9: 0"><span class="bf-cell-i">9</span></div><div class="bf-cell" title="bit 10: 0"><span class="bf-cell-i">10</span></div><div class="bf-cell" title="bit 11: 0"><span class="bf-cell-i">11</span></div><div class="bf-cell" title="bit 12: 0"><span class="bf-cell-i">12</span></div><div class="bf-cell" title="bit 13: 0"><span class="bf-cell-i">13</span></div><div class="bf-cell" title="bit 14: 0"><span class="bf-cell-i">14</span></div><div class="bf-cell" title="bit 15: 0"><span class="bf-cell-i">15</span></div><div class="bf-cell" title="bit 16: 0"><span class="bf-cell-i">16</span></div><div class="bf-cell" title="bit 17: 0"><span class="bf-cell-i">17</span></div><div class="bf-cell" title="bit 18: 0"><span class="bf-cell-i">18</span></div><div class="bf-cell" title="bit 19: 0"><span class="bf-cell-i">19</span></div><div class="bf-cell" title="bit 20: 0"><span class="bf-cell-i">20</span></div><div class="bf-cell" title="bit 21: 0"><span class="bf-cell-i">21</span></div><div class="bf-cell" title="bit 22: 0"><span class="bf-cell-i">22</span></div><div class="bf-cell" title="bit 23: 0"><span class="bf-cell-i">23</span></div><div class="bf-cell" title="bit 24: 0"><span class="bf-cell-i">24</span></div><div class="bf-cell" title="bit 25: 0"><span class="bf-cell-i">25</span></div><div class="bf-cell" title="bit 26: 0"><span class="bf-cell-i">26</span></div><div class="bf-cell" title="bit 27: 0"><span class="bf-cell-i">27</span></div><div class="bf-cell" title="bit 28: 0"><span class="bf-cell-i">28</span></div><div class="bf-cell" title="bit 29: 0"><span class="bf-cell-i">29</span></div><div class="bf-cell" title="bit 30: 0"><span class="bf-cell-i">30</span></div><div class="bf-cell" title="bit 31: 0"><span class="bf-cell-i">31</span></div><div class="bf-cell" title="bit 32: 0"><span class="bf-cell-i">32</span></div><div class="bf-cell" title="bit 33: 0"><span class="bf-cell-i">33</span></div><div class="bf-cell" title="bit 34: 0"><span class="bf-cell-i">34</span></div><div class="bf-cell" title="bit 35: 0"><span class="bf-cell-i">35</span></div><div class="bf-cell" title="bit 36: 0"><span class="bf-cell-i">36</span></div><div class="bf-cell" title="bit 37: 0"><span class="bf-cell-i">37</span></div><div class="bf-cell" title="bit 38: 0"><span class="bf-cell-i">38</span></div><div class="bf-cell" title="bit 39: 0"><span class="bf-cell-i">39</span></div><div class="bf-cell" title="bit 40: 0"><span class="bf-cell-i">40</span></div><div class="bf-cell" title="bit 41: 0"><span class="bf-cell-i">41</span></div><div class="bf-cell" title="bit 42: 0"><span class="bf-cell-i">42</span></div><div class="bf-cell" title="bit 43: 0"><span class="bf-cell-i">43</span></div><div class="bf-cell" title="bit 44: 0"><span class="bf-cell-i">44</span></div><div class="bf-cell" title="bit 45: 0"><span class="bf-cell-i">45</span></div><div class="bf-cell" title="bit 46: 0"><span class="bf-cell-i">46</span></div><div class="bf-cell" title="bit 47: 0"><span class="bf-cell-i">47</span></div></div><div class="bf-side"><header class="bf-side-head"><h4>inserted keys</h4><span>ground truth (the filter doesn&#x27;t store this)</span></header><p class="bf-empty">none yet. try inserting &quot;omar&quot;, &quot;mohammed&quot;, &quot;fatma&quot;.</p><div class="bf-quick"><button class="bf-chip">+ <!-- -->omar</button><button class="bf-chip">+ <!-- -->mohammed</button><button class="bf-chip">+ <!-- -->fatma</button><button class="bf-chip">+ <!-- -->ahmed</button><button class="bf-chip">+ <!-- -->salma</button></div></div><style>
+      .bf {
+        font-family: var(--mono);
+        font-size: 0.92rem;
+        background: var(--bg-soft);
+        border: 1px solid var(--bg2);
+        border-radius: 8px;
+        padding: 1.25rem;
+        margin: 2rem 0;
+        color: var(--fg);
+        display: grid;
+        grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr);
+        gap: 1rem;
+      }
+      @media (max-width: 720px) { .bf { grid-template-columns: 1fr; } }
+
+      .bf-controls { display: flex; flex-direction: column; gap: 0.55rem; }
+      .bf-row { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+      .bf-input {
+        flex: 1 1 9rem;
+        background: var(--bg);
+        border: 1px solid var(--bg2);
+        color: var(--fg);
+        padding: 0.45rem 0.7rem;
+        border-radius: 4px;
+        font-family: var(--mono);
+        font-size: 0.9rem;
+      }
+      .bf-input:focus { outline: 1px solid var(--aqua); border-color: var(--aqua); }
+      .bf-btn {
+        background: var(--bg); color: var(--fg-dim);
+        border: 1px solid var(--bg2);
+        padding: 0.45rem 0.85rem; border-radius: 4px;
+        cursor: pointer; font-family: var(--mono); font-size: 0.85rem;
+        transition: background 100ms, color 100ms, border-color 100ms;
+      }
+      .bf-btn:hover:not(:disabled) { background: var(--bg2); color: var(--yellow); border-color: var(--yellow); }
+      .bf-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+      .bf-btn-primary { color: var(--green); border-color: color-mix(in srgb, var(--green) 50%, transparent); }
+      .bf-btn-primary:hover:not(:disabled) { color: var(--bg); background: var(--green); border-color: var(--green); }
+      .bf-btn-warn { color: var(--orange); border-color: color-mix(in srgb, var(--orange) 50%, transparent); }
+      .bf-btn-warn:hover:not(:disabled) { color: var(--bg); background: var(--orange); border-color: var(--orange); }
+
+      .bf-sliders { gap: 1rem; }
+      .bf-slider { display: flex; flex-direction: column; gap: 0.3rem; flex: 1 1 12rem; font-size: 0.78rem; color: var(--fg-soft); }
+      .bf-slider strong { color: var(--yellow); font-weight: 600; }
+      .bf-slider input[type=&quot;range&quot;] { accent-color: var(--aqua); width: 100%; }
+
+      .bf-stats { display: flex; flex-wrap: wrap; gap: 0.6rem; margin-top: 0.2rem; }
+      .bf-stat {
+        background: var(--bg);
+        border: 1px dashed var(--bg2);
+        border-radius: 4px;
+        padding: 0.4rem 0.7rem;
+        display: flex;
+        flex-direction: column;
+        gap: 0.15rem;
+      }
+      .bf-stat-label { font-size: 0.68rem; color: var(--gray); letter-spacing: 0.08em; text-transform: uppercase; }
+      .bf-stat-value { font-size: 0.9rem; color: var(--fg); }
+
+      .bf-grid {
+        grid-column: 1 / -1;
+        margin-top: 0.6rem;
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(2rem, 1fr));
+        gap: 0.25rem;
+        background: var(--bg);
+        border: 1px solid var(--bg2);
+        border-radius: 6px;
+        padding: 0.7rem;
+      }
+      .bf-cell {
+        position: relative;
+        aspect-ratio: 1;
+        display: grid;
+        place-items: center;
+        background: var(--bg-soft);
+        border: 1px solid var(--bg2);
+        border-radius: 3px;
+        color: var(--gray);
+        font-size: 0.62rem;
+        transition: background 120ms, color 120ms, border-color 120ms;
+      }
+      .bf-cell-i { font-family: var(--mono); }
+      .bf-cell.set {
+        background: color-mix(in srgb, var(--yellow) 28%, var(--bg));
+        border-color: var(--yellow);
+        color: var(--fg-dim);
+      }
+      .bf-cell.probed {
+        outline: 2px solid var(--aqua);
+        outline-offset: -2px;
+      }
+      .bf-cell.set.probed {
+        outline-color: var(--green);
+      }
+
+      .bf-trace {
+        grid-column: 1 / -1;
+        margin-top: 0.5rem;
+        background: var(--bg);
+        border: 1px dashed var(--bg2);
+        border-radius: 4px;
+        padding: 0.6rem 0.85rem;
+        color: var(--fg-soft);
+        font-size: 0.85rem;
+        line-height: 1.55;
+      }
+      .bf-trace strong { color: var(--yellow); font-weight: 600; }
+      .bf-bit { color: var(--fg); }
+      .bf-bit.hit { color: var(--green); }
+      .bf-bit.miss { color: var(--red); }
+
+      .bf-verdict { font-weight: 600; }
+      .bf-verdict.no { color: var(--red); }
+      .bf-verdict.maybe { color: var(--orange); }
+      .bf-verdict.yes { color: var(--green); }
+
+      .bf-side {
+        background: var(--bg);
+        border: 1px solid var(--bg2);
+        border-radius: 6px;
+        padding: 0.85rem 0.95rem;
+        display: flex;
+        flex-direction: column;
+        gap: 0.55rem;
+      }
+      .bf-side-head { display: flex; flex-direction: column; gap: 0.1rem; }
+      .bf-side-head h4 { margin: 0; font-size: 0.82rem; color: var(--yellow); letter-spacing: 0.05em; }
+      .bf-side-head span { font-size: 0.7rem; color: var(--gray); font-style: italic; }
+      .bf-keys { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 0.18rem; max-height: 10rem; overflow-y: auto; font-size: 0.85rem; color: var(--blue); }
+      .bf-keys li { padding: 0.1rem 0; border-bottom: 1px dashed var(--bg2); }
+      .bf-empty { color: var(--gray); font-style: italic; margin: 0; font-size: 0.82rem; }
+      .bf-quick { display: flex; flex-wrap: wrap; gap: 0.3rem; margin-top: auto; padding-top: 0.5rem; border-top: 1px solid var(--bg2); }
+      .bf-chip {
+        background: var(--bg-soft); color: var(--fg-soft);
+        border: 1px solid var(--bg2); border-radius: 999px;
+        padding: 0.22rem 0.6rem; font-family: var(--mono); font-size: 0.74rem;
+        cursor: pointer; transition: color 100ms, border-color 100ms;
+      }
+      .bf-chip:hover:not(:disabled) { color: var(--yellow); border-color: var(--yellow); }
+      .bf-chip:disabled { opacity: 0.35; cursor: not-allowed; }
+    </style></div><!--astro:end--></astro-island>
+<p>Try it. Click a few of the chips on the right to insert names. Watch the bits light up. Now query a name you inserted: it will say “probably in set.” Query a name you did not: it will almost always say “definitely not in set.” Sometimes, especially when the filter gets full, it will lie and say “maybe” for a key that was never inserted. That is a false positive.</p>
+<p>False positives cost you a wasted SSTable read. They never cost you a correctness bug, because the worst case is “we looked, and it was not there.” False negatives, on the other hand, would be a disaster, and bloom filters never produce them.</p>
+<aside class="sidenote"> <p>A rough rule: about 10 bits per key gives you a 1% false-positive rate at the optimal <code>k</code>. The original paper is by Burton Bloom (1970). It is short and very readable.</p> </aside>
+<p>Slide <code>m</code> (the number of bits) up. The false-positive rate drops. Now play with <code>k</code>. There is a sweet spot: too few hashes and collisions kill you, too many and you set the array to 1 too fast. The math behind the optimal <code>k</code> is in DDIA, but the slider is the friendlier teacher.</p>
+<p>A bloom filter on each SSTable means a <code>get</code> walks past the files that definitely do not have the key, and only opens the ones that might. In practice, that turns a stack walk into something close to a single seek for most reads.</p>
+<h2 id="compaction-paying-the-bill">Compaction: paying the bill</h2>
+<p>Every flush adds an SSTable. The stack only grows. After a while there are too many files: more files to walk, more bloom filters to check, more disk space spent on overwritten or deleted keys that nobody asked for.</p>
+<p>So databases run <strong>compaction</strong>. The idea is simple. Take some set of SSTables, merge them into one bigger sorted file, drop everything that is shadowed by a newer write or a tombstone, and replace the old files with the new one.</p>
+<p>Compaction is the bill we pay later for cheap writes earlier. It runs in the background. There are a few common strategies for which files to merge, and they are not all the same.</p>
+<p><strong>Size-tiered compaction.</strong> Group SSTables by size. When you have N files of about the same size, merge them into one bigger file. The bigger files form a higher tier and get merged with each other later. Cassandra’s STCS works this way. It is simple and friendly to writes, but it can spike on disk space, because right before a big merge you can hold two copies of a lot of data.</p>
+<p><strong>Leveled compaction.</strong> Lay the files out in levels. L0 is where flushes go, and L0 files can have overlapping key ranges. L1 and below are bounded in total size, and within each level files have non-overlapping key ranges. When a level gets too big, you take a file from it and merge it down into the next level. RocksDB and LevelDB use leveled compaction by default. It is heavier on writes but kinder on reads, because each level holds at most one file per key range.</p>
+<p>There is no free lunch. Compaction is a trade between three quantities:</p>
+<ul>
+<li><strong>write amplification:</strong> how many times the same byte gets rewritten before it settles down.</li>
+<li><strong>read amplification:</strong> how many files a read might have to visit.</li>
+<li><strong>space amplification:</strong> how much extra disk you keep for stale data, in the worst case.</li>
+</ul>
+<p>You get to pick two. Tiered favors writes and space (at the cost of reads). Leveled favors reads and space (at the cost of writes). Hybrids exist; RocksDB ships several.</p>
+<aside class="sidenote"> <p>Cassandra has a third strategy, <em>time-window compaction</em>, made for time-series data where old keys are rarely overwritten. It groups SSTables by the time window they cover and only compacts within a window.</p> </aside>
+<h2 id="the-full-picture">The full picture</h2>
+<p>Now we can put the whole machine on one screen. The next demo includes everything we have talked about, plus one piece we have skipped: the <strong>WAL</strong>.</p>
+<p>The WAL, or write-ahead log, is what keeps us safe in a crash. Every write goes to the WAL on disk <em>before</em> it goes to the memtable. If the process dies, we replay the WAL on restart and rebuild the memtable. When we flush the memtable to a new SSTable, the WAL is no longer needed and gets truncated.</p>
+<astro-island uid="ZME23n" prefix="r2" component-url="/_astro/SSTableDemo.vwSLd0dK.js" component-export="default" renderer-url="/_astro/client.BuOr9PT5.js" props="{}" ssr="" client="load" opts="{&quot;name&quot;:&quot;SSTableDemo&quot;,&quot;value&quot;:true}" await-children=""><div class="sst"><div class="sst-controls"><div class="sst-row"><input class="sst-input" placeholder="key" value=""/><input class="sst-input" placeholder="value" value=""/><button class="sst-btn sst-btn-primary">put</button></div><div class="sst-row"><input class="sst-input" placeholder="lookup key" value=""/><button class="sst-btn">get</button></div><div class="sst-row"><button class="sst-btn sst-btn-warn">flush memtable</button><button class="sst-btn sst-btn-ghost">compact</button><button class="sst-btn sst-btn-demo">▶ run demo</button><button class="sst-btn">reset</button></div><div class="sst-row sst-strategy"><span class="sst-strategy-label">compaction:</span><button class="sst-pill active">size-tiered</button><button class="sst-pill ">leveled</button><span class="sst-strategy-hint">merge ≥ 3 sstables of same level into the next level</span></div></div><div class="sst-grid"><section class="sst-panel"><header class="sst-panel-head"><h4>WAL</h4><span>2<!-- --> entr<!-- -->ies<!-- --> · append-only</span></header><ol class="sst-wal"><li><span class="sst-ln">1</span><span class="sst-key">omar</span><span class="sst-arrow">→</span><span class="sst-val ">engineer</span></li><li><span class="sst-ln">2</span><span class="sst-key">mohammed</span><span class="sst-arrow">→</span><span class="sst-val ">musician</span></li></ol><p class="sst-foot">crash-safe replay source for the memtable.</p></section><section class="sst-panel"><header class="sst-panel-head"><h4>event log</h4><span>most recent at the bottom</span></header><div class="sst-events"><div class="sst-event tone-info"><span class="sst-event-tag">info</span><span>ready. memtable preloaded with 2 entries.</span></div></div></section></div><div class="sst-board"><section class="sst-section"><header class="sst-section-head"><h4>memtable</h4><span>mutable · in-memory</span></header><ul class="sst-list"><li class=""><span class="sst-key">mohammed</span><span class="sst-arrow">→</span><span class="sst-val">musician</span><button class="sst-x" aria-label="delete mohammed" title="write tombstone">×</button></li><li class=""><span class="sst-key">omar</span><span class="sst-arrow">→</span><span class="sst-val">engineer</span><button class="sst-x" aria-label="delete omar" title="write tombstone">×</button></li></ul></section><p class="sst-hint">put some entries, then flush to materialize an sstable at L0.</p></div><style>
+      .sst {
+        font-family: var(--mono);
+        font-size: 0.92rem;
+        background: var(--bg-soft);
+        border: 1px solid var(--bg2);
+        border-radius: 8px;
+        padding: 1.25rem;
+        margin: 2rem 0;
+        color: var(--fg);
+      }
+      .sst-controls { display: flex; flex-direction: column; gap: 0.6rem; }
+      .sst-row { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+      .sst-input {
+        flex: 1 1 8rem;
+        background: var(--bg);
+        border: 1px solid var(--bg2);
+        color: var(--fg);
+        padding: 0.45rem 0.7rem;
+        border-radius: 4px;
+        font-family: var(--mono);
+        font-size: 0.9rem;
+      }
+      .sst-input:focus { outline: 1px solid var(--aqua); border-color: var(--aqua); }
+      .sst-btn {
+        background: var(--bg);
+        color: var(--fg-dim);
+        border: 1px solid var(--bg2);
+        padding: 0.45rem 0.85rem;
+        border-radius: 4px;
+        cursor: pointer;
+        font-family: var(--mono);
+        font-size: 0.85rem;
+        transition: background 100ms, color 100ms, border-color 100ms;
+      }
+      .sst-btn:hover:not(:disabled) { background: var(--bg2); color: var(--yellow); border-color: var(--yellow); }
+      .sst-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+      .sst-btn-primary { color: var(--green); border-color: color-mix(in srgb, var(--green) 50%, transparent); }
+      .sst-btn-primary:hover:not(:disabled) { color: var(--bg); background: var(--green); border-color: var(--green); }
+      .sst-btn-warn { color: var(--orange); border-color: color-mix(in srgb, var(--orange) 50%, transparent); }
+      .sst-btn-warn:hover:not(:disabled) { color: var(--bg); background: var(--orange); border-color: var(--orange); }
+      .sst-btn-ghost { color: var(--purple); border-color: color-mix(in srgb, var(--purple) 50%, transparent); }
+      .sst-btn-ghost:hover:not(:disabled) { color: var(--bg); background: var(--purple); border-color: var(--purple); }
+      .sst-btn-demo { color: var(--aqua); border-color: color-mix(in srgb, var(--aqua) 50%, transparent); }
+      .sst-btn-demo:hover:not(:disabled) { color: var(--bg); background: var(--aqua); border-color: var(--aqua); }
+      .sst-btn-running { color: var(--bg); background: var(--red); border-color: var(--red); }
+
+      .sst-strategy { gap: 0.4rem; }
+      .sst-strategy-label { color: var(--gray); font-size: 0.78rem; }
+      .sst-pill {
+        background: var(--bg);
+        color: var(--fg-soft);
+        border: 1px solid var(--bg2);
+        border-radius: 999px;
+        padding: 0.25rem 0.7rem;
+        font-family: var(--mono);
+        font-size: 0.78rem;
+        cursor: pointer;
+        transition: color 100ms, border-color 100ms, background 100ms;
+      }
+      .sst-pill:hover { color: var(--yellow); border-color: var(--yellow); }
+      .sst-pill.active { color: var(--bg); background: var(--aqua); border-color: var(--aqua); }
+      .sst-strategy-hint {
+        color: var(--gray);
+        font-size: 0.74rem;
+        font-style: italic;
+        margin-left: 0.4rem;
+      }
+
+      .sst-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr);
+        gap: 0.85rem;
+        margin-top: 1rem;
+      }
+      @media (max-width: 720px) {
+        .sst-grid { grid-template-columns: 1fr; }
+      }
+
+      .sst-panel {
+        background: var(--bg);
+        border: 1px solid var(--bg2);
+        border-radius: 6px;
+        padding: 0.8rem 0.9rem;
+        display: flex;
+        flex-direction: column;
+        min-height: 12rem;
+      }
+      .sst-panel-head {
+        display: flex; justify-content: space-between; align-items: baseline;
+        margin-bottom: 0.55rem; gap: 0.5rem;
+      }
+      .sst-panel-head h4 {
+        margin: 0; font-size: 0.82rem; color: var(--yellow); letter-spacing: 0.05em;
+      }
+      .sst-panel-head span { font-size: 0.7rem; color: var(--gray); }
+
+      .sst-wal {
+        list-style: none; padding: 0; margin: 0;
+        font-size: 0.82rem;
+        flex: 1;
+        overflow-y: auto;
+        max-height: 14rem;
+      }
+      .sst-wal li {
+        display: grid;
+        grid-template-columns: 1.6em 1fr auto 1fr;
+        align-items: center;
+        gap: 0.4rem;
+        padding: 0.18rem 0;
+        border-bottom: 1px dashed var(--bg2);
+      }
+      .sst-ln { color: var(--gray); font-size: 0.72rem; text-align: right; }
+
+      .sst-foot {
+        margin: 0.5rem 0 0;
+        padding-top: 0.5rem;
+        border-top: 1px solid var(--bg2);
+        color: var(--gray);
+        font-size: 0.74rem;
+        font-style: italic;
+      }
+
+      .sst-events {
+        flex: 1;
+        overflow-y: auto;
+        max-height: 14rem;
+        font-size: 0.78rem;
+        line-height: 1.5;
+        font-family: var(--mono);
+      }
+      .sst-event {
+        display: grid;
+        grid-template-columns: 5em 1fr;
+        gap: 0.5rem;
+        padding: 0.18rem 0;
+        border-bottom: 1px dashed var(--bg2);
+        color: var(--fg-soft);
+      }
+      .sst-event-tag {
+        font-size: 0.68rem;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--gray);
+      }
+      .tone-wal .sst-event-tag { color: var(--blue); }
+      .tone-flush .sst-event-tag { color: var(--orange); }
+      .tone-compact .sst-event-tag { color: var(--purple); }
+      .tone-read .sst-event-tag { color: var(--aqua); }
+      .tone-info .sst-event-tag { color: var(--gray); }
+
+      .sst-board {
+        display: flex;
+        gap: 0.85rem;
+        overflow-x: auto;
+        padding: 1.5rem 0 0.5rem;
+        align-items: flex-start;
+      }
+      .sst-level {
+        display: flex; flex-direction: column; gap: 0.4rem; flex: 0 0 auto;
+      }
+      .sst-level-label {
+        font-size: 0.72rem; color: var(--yellow);
+        letter-spacing: 0.1em; padding-left: 0.2rem;
+      }
+      .sst-level-stack { display: flex; gap: 0.6rem; }
+
+      .sst-section {
+        background: var(--bg);
+        border: 1px solid var(--bg2);
+        border-radius: 6px;
+        padding: 0.8rem 0.9rem;
+        min-width: 14rem;
+        flex: 0 0 auto;
+      }
+      .sst-section-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+        margin-bottom: 0.6rem;
+        gap: 0.5rem;
+      }
+      .sst-section-head h4 { margin: 0; font-size: 0.85rem; color: var(--yellow); letter-spacing: 0.04em; }
+      .sst-section-head span { font-size: 0.7rem; color: var(--gray); }
+
+      .sst-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 0.25rem; }
+      .sst-list li {
+        display: grid;
+        grid-template-columns: 1fr auto 1fr auto;
+        align-items: center;
+        gap: 0.4rem;
+        padding: 0.3rem 0.4rem;
+        border-radius: 3px;
+        background: var(--bg-soft);
+      }
+      .sst-list li.tombstone { color: var(--gray); text-decoration: line-through; opacity: 0.7; }
+      .sst-key { color: var(--blue); }
+      .sst-arrow { color: var(--gray); }
+      .sst-val { color: var(--fg); }
+      .sst-val.tomb { color: var(--red); text-decoration: line-through; }
+      .sst-list li.tombstone .sst-val { color: var(--red); text-decoration: none; }
+      .sst-x {
+        background: transparent; border: none; color: var(--gray);
+        cursor: pointer; font-size: 1rem; line-height: 1; padding: 0 0.2rem;
+      }
+      .sst-x:hover { color: var(--red); }
+
+      .sst-empty { color: var(--gray); font-style: italic; margin: 0; font-size: 0.85rem; }
+      .sst-hint { color: var(--gray); font-style: italic; align-self: center; padding: 1rem; margin: 0; }
+    </style></div><!--astro:end--></astro-island>
+<p>Try it.</p>
+<ol>
+<li>Type a few <code>put</code>s. Watch each one show up in both the WAL and the memtable, with an event log entry “append to WAL, then memtable.”</li>
+<li>Click <code>flush memtable</code>. The memtable empties, a new sstable appears at L0, and the WAL is truncated.</li>
+<li>Flush a few more times. Now you have a few files at L0.</li>
+<li>Toggle the compaction strategy at the top, then click <code>compact</code>. With size-tiered, the L0 files are merged into one bigger file at L1. With leveled, the same merge happens, but the resulting L1 file is the <em>one</em> file at that level; the next compaction will merge into it again.</li>
+<li>Run a <code>get</code> for a key. The event log shows the walk: memtable, then sstable-by-sstable, newest first.</li>
+</ol>
+<p>The event log is the narrator. In a real system, this log is statistics and metrics, not a story. But it is the same story.</p>
+<h2 id="the-other-school-b-trees">The other school: B-trees</h2>
+<p>LSM-trees are one answer. The other answer, older and quieter, is the <strong>B-tree</strong>. Most relational databases use it: Postgres, MySQL/InnoDB, SQLite, Oracle. So does the index of every disk filesystem you have ever touched.</p>
+<p>Here is the shape. Data lives in fixed-size pages on disk, usually 4 to 16 KB. Each page holds either keys-and-values (a leaf) or keys-and-pointers-to-other-pages (an internal node). The tree is balanced: every leaf is at the same depth.</p>
+<astro-island uid="iTE9V" prefix="r3" component-url="/_astro/BTreeDemo.DvVKuntY.js" component-export="default" renderer-url="/_astro/client.BuOr9PT5.js" props="{}" ssr="" client="load" opts="{&quot;name&quot;:&quot;BTreeDemo&quot;,&quot;value&quot;:true}" await-children=""><div class="bt"><div class="bt-controls"><div class="bt-row"><input class="bt-input" placeholder="key (e.g. 10)" value=""/><button class="bt-btn bt-btn-primary">insert</button></div><div class="bt-row"><input class="bt-input" placeholder="search key" value=""/><button class="bt-btn">search</button><button class="bt-btn">seed</button><button class="bt-btn bt-btn-warn">reset</button></div><div class="bt-row bt-order"><span class="bt-order-label">max keys per node:</span><button class="bt-pill ">2</button><button class="bt-pill active">3</button><button class="bt-pill ">4</button><span class="bt-order-hint">smaller = splits sooner</span></div></div><div class="bt-viewport"><p class="bt-empty">empty tree. insert a few keys, or click seed.</p></div><div class="bt-foot"><span>height: <!-- -->0</span><span>keys: <!-- -->0</span><span>nodes: <!-- -->1</span></div><style>
+      .bt {
+        font-family: var(--mono);
+        font-size: 0.92rem;
+        background: var(--bg-soft);
+        border: 1px solid var(--bg2);
+        border-radius: 8px;
+        padding: 1.25rem;
+        margin: 2rem 0;
+        color: var(--fg);
+      }
+      .bt-controls { display: flex; flex-direction: column; gap: 0.55rem; }
+      .bt-row { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+      .bt-input {
+        flex: 1 1 8rem;
+        background: var(--bg);
+        border: 1px solid var(--bg2);
+        color: var(--fg);
+        padding: 0.45rem 0.7rem;
+        border-radius: 4px;
+        font-family: var(--mono);
+        font-size: 0.9rem;
+      }
+      .bt-input:focus { outline: 1px solid var(--aqua); border-color: var(--aqua); }
+      .bt-btn {
+        background: var(--bg); color: var(--fg-dim);
+        border: 1px solid var(--bg2);
+        padding: 0.45rem 0.85rem; border-radius: 4px;
+        cursor: pointer; font-family: var(--mono); font-size: 0.85rem;
+        transition: background 100ms, color 100ms, border-color 100ms;
+      }
+      .bt-btn:hover { background: var(--bg2); color: var(--yellow); border-color: var(--yellow); }
+      .bt-btn-primary { color: var(--green); border-color: color-mix(in srgb, var(--green) 50%, transparent); }
+      .bt-btn-primary:hover { color: var(--bg); background: var(--green); border-color: var(--green); }
+      .bt-btn-warn { color: var(--orange); border-color: color-mix(in srgb, var(--orange) 50%, transparent); }
+      .bt-btn-warn:hover { color: var(--bg); background: var(--orange); border-color: var(--orange); }
+
+      .bt-order-label { color: var(--gray); font-size: 0.78rem; }
+      .bt-pill {
+        background: var(--bg); color: var(--fg-soft);
+        border: 1px solid var(--bg2); border-radius: 999px;
+        padding: 0.22rem 0.7rem; font-family: var(--mono); font-size: 0.78rem;
+        cursor: pointer; transition: color 100ms, border-color 100ms, background 100ms;
+      }
+      .bt-pill:hover { color: var(--yellow); border-color: var(--yellow); }
+      .bt-pill.active { color: var(--bg); background: var(--aqua); border-color: var(--aqua); }
+      .bt-order-hint { color: var(--gray); font-size: 0.74rem; font-style: italic; margin-left: 0.4rem; }
+
+      .bt-viewport {
+        margin-top: 1rem;
+        background: var(--bg);
+        border: 1px solid var(--bg2);
+        border-radius: 6px;
+        padding: 1rem;
+        overflow-x: auto;
+        min-height: 8rem;
+      }
+      .bt-empty {
+        color: var(--gray); font-style: italic; margin: 0;
+        font-size: 0.85rem; text-align: center; padding: 1.5rem 0;
+      }
+      .bt-svg { display: block; margin: 0 auto; }
+
+      .bt-node {
+        fill: var(--bg-soft);
+        stroke: var(--bg3);
+        stroke-width: 1;
+        transition: fill 150ms, stroke 150ms;
+      }
+      .bt-node.on {
+        stroke: var(--aqua);
+        stroke-width: 2;
+        fill: color-mix(in srgb, var(--aqua) 14%, var(--bg-soft));
+      }
+      .bt-node.found {
+        stroke: var(--green);
+        stroke-width: 2;
+        fill: color-mix(in srgb, var(--green) 22%, var(--bg-soft));
+      }
+      .bt-key-text {
+        fill: var(--fg);
+        font-family: var(--mono);
+        font-size: 13px;
+      }
+      .bt-empty-text {
+        fill: var(--gray);
+        font-family: var(--mono);
+        font-size: 14px;
+      }
+      .bt-sep {
+        stroke: var(--bg3);
+        stroke-width: 1;
+      }
+      .bt-edge {
+        stroke: var(--bg3);
+        stroke-width: 1;
+        fill: none;
+      }
+      .bt-edge.on {
+        stroke: var(--aqua);
+        stroke-width: 2;
+      }
+
+      .bt-trace {
+        margin-top: 0.7rem;
+        background: var(--bg);
+        border: 1px dashed var(--bg2);
+        border-radius: 4px;
+        padding: 0.55rem 0.85rem;
+        color: var(--fg-soft);
+        font-size: 0.85rem;
+      }
+      .bt-trace strong { color: var(--yellow); font-weight: 600; }
+      .bt-verdict.ok { color: var(--green); font-weight: 600; }
+      .bt-verdict.no { color: var(--red); font-weight: 600; }
+
+      .bt-foot {
+        margin-top: 0.55rem;
+        display: flex;
+        gap: 1rem;
+        font-size: 0.74rem;
+        color: var(--gray);
+        font-family: var(--mono);
+        letter-spacing: 0.06em;
+      }
+    </style></div><!--astro:end--></astro-island>
+<p>Click <code>seed</code> to fill a small tree. Search for a key. Try <code>12</code>. The path lights up: root, child, leaf. The whole search takes a number of disk reads equal to the height of the tree, which is short. A B-tree with branching factor 100 can index 100 million keys in three or four levels. That is why a relational database can answer a point lookup in milliseconds.</p>
+<p>Now insert new keys, especially ones that go into a full leaf. The leaf splits. The median key moves up to the parent. If the parent is also full, it splits too. The split can cascade all the way to the root, and a new root is born. That is the only time a B-tree grows in height.</p>
+<p>This is <strong>update in place</strong>. Every change rewrites a page on disk. To do that safely, B-tree databases also keep a write-ahead log, usually called a <em>redo log</em> in this world, so a crash in the middle of a page write does not leave a corrupted page. Same idea as the LSM WAL: write the change to a log first, then update the in-place structure.</p>
+<aside class="sidenote"> <p>B-trees were invented by Bayer and McCreight at Boeing in 1971. They never said publicly what the <em>B</em> stands for. <em>Boeing</em> is a popular guess. <em>Balanced</em> is another. Bayer is still alive and still will not tell.</p> </aside>
+<p>Drop <code>max keys per node</code> to 2 and re-seed. Now splits happen on almost every insert. The tree is taller, the cascades are dramatic, and you can see the whole story. This is what real B-trees do, just with bigger nodes and shallower trees.</p>
+<h2 id="lsm-trees-vs-b-trees-the-trade-offs">LSM-trees vs B-trees: the trade-offs</h2>
+<p>Both designs solve the same problem. They make different trades. Six dimensions matter. For each one, the verdict comes first, and the reason follows.</p>
+<p><strong>Writes → LSM-trees win.</strong> Every write is a sequential append: WAL, then memtable, then a sorted-file flush, then merges in the background. B-trees update a page in place, which often means a random write to a random spot on disk. SSDs feel this less than spinning disks did, but sequential writes are still cheaper.</p>
+<p><strong>Reads → B-trees win, by default.</strong> A B-tree read is one walk down a short tree. An LSM read checks the memtable, then walks several SSTables, with bloom filters skipping most of them. With well-tuned filters and well-shaped levels, an LSM is close to a B-tree in practice. Without that tuning, it is much slower.</p>
+<p><strong>Space → call it a draw.</strong> B-trees waste a little space inside half-full pages, the famous <em>fragmentation</em> of database tuning. LSM-trees waste space in two places: stale rows that have not been compacted yet, and a temporary doubling during compaction. Different shapes of waste, similar size.</p>
+<p><strong>Range scans → B-trees win, slightly.</strong> Both are good. B-trees give you sorted order natively: walk the leaves left to right. LSM-trees merge several sorted runs at read time, which is also fine, but slightly more work per row.</p>
+<p><strong>Transactions → B-trees win.</strong> B-trees lock pages and use the WAL for atomic commit. This is a deeply studied area with decades of practice. LSM-tree transactions exist (RocksDB has them, FoundationDB is built on one), but they are added on top, not the default shape of the engine.</p>
+<p><strong>Crash recovery → call it a draw.</strong> Both use a write-ahead log, and both replay it on startup. An LSM replays back to the last memtable flush; a B-tree replays back to the last checkpoint. Comparable in practice.</p>
+<p>So which do you pick? Write-heavy workload, data much bigger than RAM, no strong transactional needs on day one: pick LSM. Read-heavy, transactional, with predictable latency: pick B-tree.</p>
+<p>Most modern databases give you both, in different parts of the system. Postgres has a B-tree as the primary index, but its WAL is, in spirit, an LSM-style log. Cassandra is an LSM, but each SSTable has a small B-tree-like index inside it. The line is not a wall. It is a continuum.</p>
+<h2 id="why-this-matters">Why this matters</h2>
+<p>You are using both designs all the time, even if you have never written <code>CREATE INDEX</code> in your life.</p>
+<p>When you query Postgres, you walk a B-tree. When you message a friend on a chat app backed by Cassandra, you append to an LSM-tree. When you scroll a feed or play a video, the metadata server is, almost certainly, an LSM. When you <code>git log</code>, you are walking yet another sorted, immutable, content-addressed file format that is not far in spirit from an SSTable.</p>
+<p>Storage engines are not glamorous. But they are where the laws of disk physics meet the laws of software design. The trade-offs they make show up everywhere: in your latency tail, your cloud bill, your replication topology, the database you would never have picked but were stuck with anyway.</p>
+<p>Now, when you read a Cassandra performance issue or a Postgres tuning guide, the words <em>write amplification</em>, <em>page split</em>, <em>bloom filter</em>, <em>memtable</em> are not jargon. They are the names of pieces in a small, knowable machine.</p>
+<hr/>
+<p><em>Next post: we open up the actual on-disk SSTable format. Block layout, restart points, footers, and why these particular numbers are the numbers.</em></p>  </div> </article>  </body></html>

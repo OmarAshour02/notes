@@ -1,0 +1,39 @@
+---
+import BaseLayout from "~/layouts/BaseLayout.astro";
+import { getCollection } from "astro:content";
+
+const posts = (await getCollection("posts", ({ data }) => !data.draft)).sort(
+  (a, b) => b.data.date.valueOf() - a.data.date.valueOf()
+);
+---
+
+<BaseLayout title="Notes — a technical journal">
+  <main class="home">
+    <h1 class="home-title">
+      <span class="accent">N</span>otes
+    </h1>
+    <p class="home-tagline">
+      Systems, storage, and the things behind the abstractions.
+    </p>
+
+    <ul class="post-list">
+      {posts.map((post) => (
+        <li>
+          <a class="post-link" href={`/posts/${post.slug}`}>
+            <h2 class="post-title">{post.data.title}</h2>
+            {post.data.subtitle && <p class="post-desc">{post.data.subtitle}</p>}
+            <p class="post-meta">
+              {post.data.date.toLocaleDateString("en-US", {
+                year: "numeric",
+                month: "long",
+                day: "numeric",
+              })}
+              {" · "}
+              {post.data.readingTime}
+            </p>
+          </a>
+        </li>
+      ))}
+    </ul>
+  </main>
+</BaseLayout>

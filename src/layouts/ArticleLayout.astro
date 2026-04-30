@@ -1,0 +1,85 @@
+---
+import BaseLayout from "./BaseLayout.astro";
+import FiledUnder from "~/components/FiledUnder.astro";
+import Toc from "~/components/Toc.astro";
+
+type Heading = { depth: number; slug: string; text: string };
+
+type Props = {
+  title: string;
+  titleAccent?: string;
+  subtitle?: string;
+  author: string;
+  readingTime: string;
+  tags: string[];
+  noteId?: string;
+  hero?: { src: string; alt: string; caption?: string };
+  headings?: Heading[];
+};
+
+const {
+  title,
+  titleAccent,
+  subtitle,
+  author,
+  readingTime,
+  tags,
+  noteId,
+  hero,
+  headings = [],
+} = Astro.props;
+
+function renderTitle(t: string, accent?: string) {
+  if (!accent) return { kind: "plain" as const, text: t };
+  const idx = t.indexOf(accent);
+  if (idx === -1) return { kind: "plain" as const, text: t };
+  return {
+    kind: "split" as const,
+    before: t.slice(0, idx),
+    accent,
+    after: t.slice(idx + accent.length),
+  };
+}
+
+const parts = renderTitle(title, titleAccent);
+---
+
+<BaseLayout title={title} description={subtitle}>
+  <a class="back-btn" href="/" aria-label="Back to index">←</a>
+  <Toc headings={headings} />
+
+  <article class="article">
+    <header class="article-header">
+      {noteId && <span class="note-id">Note № {noteId}</span>}
+      <FiledUnder tags={tags} />
+      <h1 class="article-title">
+        {parts.kind === "plain" ? (
+          parts.text
+        ) : (
+          <>
+            {parts.before}
+            <span class="accent">{parts.accent}</span>
+            {parts.after}
+          </>
+        )}
+      </h1>
+      {subtitle && <p class="article-subtitle">{subtitle}</p>}
+      <p class="article-meta">
+        <span class="author">{author}</span>
+        <span class="dot">·</span>
+        <span>{readingTime}</span>
+      </p>
+    </header>
+
+    {hero && (
+      <figure class="article-hero">
+        <img src={hero.src} alt={hero.alt} loading="eager" />
+        {hero.caption && <figcaption>{hero.caption}</figcaption>}
+      </figure>
+    )}
+
+    <div class="prose">
+      <slot />
+    </div>
+  </article>
+</BaseLayout>

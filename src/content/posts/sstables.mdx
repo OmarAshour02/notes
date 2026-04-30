@@ -1,0 +1,209 @@
+---
+title: "How databases store data: from a bash log to a B-tree"
+titleAccent: "H"
+subtitle: "Two storage engines power most of the databases you've used. One is a tree of pages, updated in place. The other is a stack of immutable files, merged in the background. We will build both, badly, and see what each one costs."
+author: "Omar Ashour"
+readingTime: "~25 min read"
+date: 2026-04-30
+noteId: "0001"
+tags: ["storage", "lsm-trees", "b-trees", "databases"]
+---
+
+import Sidenote from "~/components/Sidenote.astro";
+import BashShellDemo from "~/components/demos/BashShellDemo.tsx";
+import SSTableDemo from "~/components/demos/SSTableDemo.tsx";
+import BloomFilterDemo from "~/components/demos/BloomFilterDemo.tsx";
+import BTreeDemo from "~/components/demos/BTreeDemo.tsx";
+
+A database has two jobs. Take a write and not lose it. Take a read and answer fast. Most engines pick one of two ways to do this.
+
+One way is to keep a tree on disk and update it in place. The other way is to write everything to a fresh file and never go back. Both work. Both ship at scale. They are good at different things.
+
+> **The crux:** how do you build a key-value store that is fast to write and still sane to read?
+
+We will start with the simplest database in the world. Two lines of bash. Then we will watch it fall over, and rebuild it: better files, smaller indexes, smarter merges. By the end you will know why your database makes the choice it makes.
+
+## The simplest database in the world
+
+Open any Unix shell. You can write a database in two functions:
+
+```sh
+db_set () { echo "$1,$2" >> database; }
+db_get () { grep "^$1," database | tail -n 1; }
+```
+
+That is it. Writes append a line. Reads grep for the key and take the last match. The "newest write wins" rule is hidden in that `tail -n 1`.
+
+<Sidenote>
+This is straight from chapter 3 of *Designing Data-Intensive Applications* by Martin Kleppmann. The whole post owes a lot to that chapter.
+</Sidenote>
+
+Try it:
+
+<BashShellDemo client:load />
+
+Run `db_set 42 cat`, then `db_set 42 dog`, then `db_get 42`. The new value wins because we always take the last line. Now run a few more `db_set`s. Run a `db_get` for a key you have never written. Watch the line counter on the right.
+
+Two things stand out.
+
+Writes are very fast. They are just an append. The disk head, if you have one, never has to seek.
+
+Reads are awful. Every `db_get` walks the whole file. With ten lines that is fine. With ten million it is the only thing you do all day.
+
+The fix is not to throw away the log. The log is a great thing. The fix is to add an index that tells us where to look.
+
+<Sidenote>
+This is what *Bitcask* does. Bitcask keeps a hash map in memory: every key points to the byte offset of its latest value in the log. Reads become one disk seek. Writes are still appends. The catch is that the hash map must fit in RAM, and you cannot do range scans.
+</Sidenote>
+
+## From a log to a sorted file
+
+A hash index is a fine answer if all your keys fit in memory. They often do not. So we want an index that scales further, and that supports range scans, which a hash map does not.
+
+Here is the trick. What if the file on disk were sorted by key?
+
+Then we do not need an entry per key. We can keep a *sparse* index: every hundredth key, with its byte offset. To find a key, we binary-search the sparse index, jump to the right region, and scan a little. The index is small enough to keep in memory even for huge files.
+
+This sorted-on-disk file has a name in the literature: an **SSTable**, for *Sorted String Table*. It first appeared in Google's Bigtable paper in 2006. Cassandra, RocksDB, LevelDB, and ScyllaDB are all built on it.
+
+<Sidenote>
+SSTables are also nice because two of them can be merged into one in linear time, with the same merge step from mergesort. We will use this in a minute.
+</Sidenote>
+
+An SSTable is, in spirit, three things:
+
+- A sorted sequence of `(key, value)` records.
+- A sparse index pointing into that sequence.
+- A bloom filter that can cheaply say "this key is definitely *not* in this file."
+
+The on-disk format has more details, like block compression, checksums, and a footer. But the contract is simple. It is an immutable, sorted file you can binary-search and probe.
+
+But how do we get our data into a sorted file in the first place? Writes come in random order. We cannot keep them sorted as we go without paying a real cost.
+
+So databases cheat. They keep the most recent writes in memory, in a sorted structure called a **memtable** (usually a skip list or a red-black tree). Reads check the memtable first. When the memtable gets large enough, the database flushes it: writes its contents, in sorted order, to a fresh SSTable on disk, and starts a new empty memtable.
+
+<Sidenote>
+Skip lists are popular for memtables because they are friendly to concurrent writes and roughly as fast as a balanced tree, without the rotation bookkeeping.
+</Sidenote>
+
+Old SSTables stay on disk. A `get` walks through them, newest first, until it finds the key, or a tombstone (a marker that says "this key is gone"). The newest write always wins.
+
+So now: a write is an in-memory insert plus a tiny append. A read is a memtable lookup, then a walk through some SSTables. There are still two questions to answer.
+
+First. When a read walks the SSTables, can we skip the ones that do not have the key? Yes. That is what the bloom filter is for.
+
+Second. If the stack of SSTables grows forever, reads get slow again. So how do we keep it small? That is what compaction is for.
+
+## Bloom filters: skipping files we do not need to read
+
+A bloom filter is a small piece of magic. It is an array of bits and a few hash functions. To insert a key, we hash it `k` ways and set those `k` bits to 1. To ask "is this key in the set?", we hash again and check those `k` bits.
+
+If any of those bits is 0, the answer is **no**, for sure. If all are 1, the answer is **maybe**.
+
+<BloomFilterDemo client:load />
+
+Try it. Click a few of the chips on the right to insert names. Watch the bits light up. Now query a name you inserted: it will say "probably in set." Query a name you did not: it will almost always say "definitely not in set." Sometimes, especially when the filter gets full, it will lie and say "maybe" for a key that was never inserted. That is a false positive.
+
+False positives cost you a wasted SSTable read. They never cost you a correctness bug, because the worst case is "we looked, and it was not there." False negatives, on the other hand, would be a disaster, and bloom filters never produce them.
+
+<Sidenote>
+A rough rule: about 10 bits per key gives you a 1% false-positive rate at the optimal `k`. The original paper is by Burton Bloom (1970). It is short and very readable.
+</Sidenote>
+
+Slide `m` (the number of bits) up. The false-positive rate drops. Now play with `k`. There is a sweet spot: too few hashes and collisions kill you, too many and you set the array to 1 too fast. The math behind the optimal `k` is in DDIA, but the slider is the friendlier teacher.
+
+A bloom filter on each SSTable means a `get` walks past the files that definitely do not have the key, and only opens the ones that might. In practice, that turns a stack walk into something close to a single seek for most reads.
+
+## Compaction: paying the bill
+
+Every flush adds an SSTable. The stack only grows. After a while there are too many files: more files to walk, more bloom filters to check, more disk space spent on overwritten or deleted keys that nobody asked for.
+
+So databases run **compaction**. The idea is simple. Take some set of SSTables, merge them into one bigger sorted file, drop everything that is shadowed by a newer write or a tombstone, and replace the old files with the new one.
+
+Compaction is the bill we pay later for cheap writes earlier. It runs in the background. There are a few common strategies for which files to merge, and they are not all the same.
+
+**Size-tiered compaction.** Group SSTables by size. When you have N files of about the same size, merge them into one bigger file. The bigger files form a higher tier and get merged with each other later. Cassandra's STCS works this way. It is simple and friendly to writes, but it can spike on disk space, because right before a big merge you can hold two copies of a lot of data.
+
+**Leveled compaction.** Lay the files out in levels. L0 is where flushes go, and L0 files can have overlapping key ranges. L1 and below are bounded in total size, and within each level files have non-overlapping key ranges. When a level gets too big, you take a file from it and merge it down into the next level. RocksDB and LevelDB use leveled compaction by default. It is heavier on writes but kinder on reads, because each level holds at most one file per key range.
+
+There is no free lunch. Compaction is a trade between three quantities:
+
+- **write amplification:** how many times the same byte gets rewritten before it settles down.
+- **read amplification:** how many files a read might have to visit.
+- **space amplification:** how much extra disk you keep for stale data, in the worst case.
+
+You get to pick two. Tiered favors writes and space (at the cost of reads). Leveled favors reads and space (at the cost of writes). Hybrids exist; RocksDB ships several.
+
+<Sidenote>
+Cassandra has a third strategy, *time-window compaction*, made for time-series data where old keys are rarely overwritten. It groups SSTables by the time window they cover and only compacts within a window.
+</Sidenote>
+
+## The full picture
+
+Now we can put the whole machine on one screen. The next demo includes everything we have talked about, plus one piece we have skipped: the **WAL**.
+
+The WAL, or write-ahead log, is what keeps us safe in a crash. Every write goes to the WAL on disk *before* it goes to the memtable. If the process dies, we replay the WAL on restart and rebuild the memtable. When we flush the memtable to a new SSTable, the WAL is no longer needed and gets truncated.
+
+<SSTableDemo client:load />
+
+Try it.
+
+1. Type a few `put`s. Watch each one show up in both the WAL and the memtable, with an event log entry "append to WAL, then memtable."
+2. Click `flush memtable`. The memtable empties, a new sstable appears at L0, and the WAL is truncated.
+3. Flush a few more times. Now you have a few files at L0.
+4. Toggle the compaction strategy at the top, then click `compact`. With size-tiered, the L0 files are merged into one bigger file at L1. With leveled, the same merge happens, but the resulting L1 file is the *one* file at that level; the next compaction will merge into it again.
+5. Run a `get` for a key. The event log shows the walk: memtable, then sstable-by-sstable, newest first.
+
+The event log is the narrator. In a real system, this log is statistics and metrics, not a story. But it is the same story.
+
+## The other school: B-trees
+
+LSM-trees are one answer. The other answer, older and quieter, is the **B-tree**. Most relational databases use it: Postgres, MySQL/InnoDB, SQLite, Oracle. So does the index of every disk filesystem you have ever touched.
+
+Here is the shape. Data lives in fixed-size pages on disk, usually 4 to 16 KB. Each page holds either keys-and-values (a leaf) or keys-and-pointers-to-other-pages (an internal node). The tree is balanced: every leaf is at the same depth.
+
+<BTreeDemo client:load />
+
+Click `seed` to fill a small tree. Search for a key. Try `12`. The path lights up: root, child, leaf. The whole search takes a number of disk reads equal to the height of the tree, which is short. A B-tree with branching factor 100 can index 100 million keys in three or four levels. That is why a relational database can answer a point lookup in milliseconds.
+
+Now insert new keys, especially ones that go into a full leaf. The leaf splits. The median key moves up to the parent. If the parent is also full, it splits too. The split can cascade all the way to the root, and a new root is born. That is the only time a B-tree grows in height.
+
+This is **update in place**. Every change rewrites a page on disk. To do that safely, B-tree databases also keep a write-ahead log, usually called a *redo log* in this world, so a crash in the middle of a page write does not leave a corrupted page. Same idea as the LSM WAL: write the change to a log first, then update the in-place structure.
+
+<Sidenote>
+B-trees were invented by Bayer and McCreight at Boeing in 1971. They never said publicly what the *B* stands for. *Boeing* is a popular guess. *Balanced* is another. Bayer is still alive and still will not tell.
+</Sidenote>
+
+Drop `max keys per node` to 2 and re-seed. Now splits happen on almost every insert. The tree is taller, the cascades are dramatic, and you can see the whole story. This is what real B-trees do, just with bigger nodes and shallower trees.
+
+## LSM-trees vs B-trees: the trade-offs
+
+Both designs solve the same problem. They make different trades. Six dimensions matter. For each one, the verdict comes first, and the reason follows.
+
+**Writes → LSM-trees win.** Every write is a sequential append: WAL, then memtable, then a sorted-file flush, then merges in the background. B-trees update a page in place, which often means a random write to a random spot on disk. SSDs feel this less than spinning disks did, but sequential writes are still cheaper.
+
+**Reads → B-trees win, by default.** A B-tree read is one walk down a short tree. An LSM read checks the memtable, then walks several SSTables, with bloom filters skipping most of them. With well-tuned filters and well-shaped levels, an LSM is close to a B-tree in practice. Without that tuning, it is much slower.
+
+**Space → call it a draw.** B-trees waste a little space inside half-full pages, the famous *fragmentation* of database tuning. LSM-trees waste space in two places: stale rows that have not been compacted yet, and a temporary doubling during compaction. Different shapes of waste, nearly similar size.
+
+**Range scans → B-trees win, slightly.** Both are good. B-trees give you sorted order natively: walk the leaves left to right. LSM-trees merge several sorted runs at read time, which is also fine, but slightly more work per row.
+
+**Transactions → B-trees win.** B-trees lock pages and use the WAL for atomic commit. This is a deeply studied area with decades of practice. LSM-tree transactions exist (RocksDB has them, FoundationDB is built on one), but they are added on top, not the default shape of the engine.
+
+**Crash recovery → call it a draw.** Both use a write-ahead log, and both replay it on startup. An LSM replays back to the last memtable flush; a B-tree replays back to the last checkpoint. Comparable in practice.
+
+
+Most modern databases give you both, in different parts of the system. Postgres has a B-tree as the primary index, but its WAL is, in spirit, an LSM-style log. Cassandra is an LSM, but each SSTable has a small B-tree-like index inside it. The line is not a wall. It is a continuum.
+
+## Why this matters
+
+You are using both designs all the time, even if you have never written `CREATE INDEX` in your life.
+
+When you query Postgres, you walk a B-tree. When you message a friend on a chat app backed by Cassandra, you append to an LSM-tree. When you scroll a feed or play a video, the metadata server is, almost certainly, an LSM. When you `git log`, you are walking yet another sorted, immutable, content-addressed file format that is not far in spirit from an SSTable.
+
+Storage engines are not glamorous. But they are where the laws of disk physics meet the laws of software design. The trade-offs they make show up everywhere: in your latency tail, your cloud bill, your replication topology, the database you would never have picked but were stuck with anyway.
+
+Now, when you read a Cassandra performance issue or a Postgres tuning guide, the words *write amplification*, *page split*, *bloom filter*, *memtable* are not jargon. They are the names of pieces in a small, knowable machine.
+
+---
+
