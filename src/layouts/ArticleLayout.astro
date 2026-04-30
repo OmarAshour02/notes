@@ -44,7 +44,13 @@ function renderTitle(t: string, accent?: string) {
 const parts = renderTitle(title, titleAccent);
 ---
 
-<BaseLayout title={title} description={subtitle}>
+<BaseLayout
+  title={title}
+  description={subtitle}
+  image={hero?.src}
+  imageAlt={hero?.alt}
+  type="article"
+>
   <a class="back-btn" href="/" aria-label="Back to index">←</a>
   <Toc headings={headings} />
 
