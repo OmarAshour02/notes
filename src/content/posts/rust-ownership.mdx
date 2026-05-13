@@ -1,0 +1,158 @@
+---
+title: "Who frees this? Rust's ownership and borrowing"
+titleAccent: "W"
+subtitle: "A C program asks: who frees this? A garbage-collected program asks: who cares? Rust answers the first question at compile time, and the answer is called ownership."
+author: "Omar Ashour"
+readingTime: "~10 min read"
+date: 2026-05-20
+noteId: "0002"
+tags: ["rust", "memory", "systems"]
+draft: false
+---
+
+import Sidenote from "~/components/Sidenote.astro";
+import OwnershipDemo from "~/components/demos/OwnershipDemo.tsx";
+
+A C program has a small, awful question hidden in every line that touches memory:
+
+> who frees this?
+
+If you forget to free, the memory leaks. If you free twice, the program crashes. If you free and then read, the program may do anything. It may print the wrong value, scribble on someone else's data, or just die. These are not exotic bugs. They are most bugs.
+
+A Java program does not ask this question. The garbage collector does. You allocate, you walk away, and at some later moment a thread you did not write decides to clean up. That is fine in many places. It is not fine in a kernel, or in a browser engine, or in a video game where a 50ms pause is the difference between "smooth" and "broken."
+
+Rust answers the question at compile time. There is no garbage collector. There is no manual `free`. The compiler reads your code, works out when each value's owner goes away, and inserts the cleanup for you. If your code is unclear about who the owner is, the compiler refuses to build it.
+
+> **The crux:** how do you free memory at the right time, without a garbage collector, without bugs, and without a runtime?
+
+We will see Rust's answer in three pieces: ownership, moves, and borrows. By the end, the famous "the borrow checker fought me" stories will look less mysterious. The borrow checker is not your enemy. It is a friend who is bad at small talk.
+
+## Who owns this?
+
+The rule, in one line: **every value in Rust has exactly one owner**, and when that owner goes out of scope, the value is dropped.
+
+The "owner" is just a variable. The "scope" is the block of code where the variable is alive. "Dropped" means Rust runs the cleanup code for you: for a heap allocation, it frees the memory; for a file handle, it closes the file; and so on.
+
+```rust
+fn main() {
+    let s = String::from("hello");
+    // s is the owner of a heap allocation
+} // s goes out of scope here, the String is dropped, the heap is freed
+```
+
+That is the whole idea. No GC. No `free`. The compiler sees `s` go out of scope at the closing brace, and inserts the cleanup right there.
+
+<Sidenote>
+This pattern has a name from C++: **RAII**, short for *resource acquisition is initialization*. Rust did not invent it. Rust just made it the law.
+</Sidenote>
+
+This is fine for one variable. The trouble starts when we assign one variable to another.
+
+## What happens when I say `let b = a`?
+
+In most languages, `let b = a` is harmless. Both variables point at the same value, or each holds a copy. No drama.
+
+In Rust, the answer depends on what `a` is. And the answer is the most surprising idea in the language.
+
+If `a` is a `String`, then `let b = a` is a **move**. After this line, `a` is no longer valid. You cannot use it. The compiler will refuse to read it. It is as if `a` never existed.
+
+```rust
+let a = String::from("hello");
+let b = a;            // ownership of "hello" moves to b
+println!("{}", a);    // error: borrow of moved value `a`
+```
+
+This sounds like nonsense the first time you read it. Why would `a` stop working just because we made a new name `b`? Read the rule again: every value has exactly one owner. After `let b = a`, the heap "hello" has a new owner, which is `b`. The old name `a` cannot also be an owner, because then we would have two. So the compiler invalidates `a`.
+
+Here is the move in motion. Click `let a = String::from("hello")`, then `let b = a`, then `use a`. Or just hit run demo and watch the story play out.
+
+<OwnershipDemo client:load />
+
+The heap allocation itself does not move. It sits in the same memory it always did. What moves is the small pointer that used to live in `a`'s slot on the stack. That pointer now lives in `b`'s slot. The cost of a "move" is the cost of copying three machine words. That is it. Moves are cheap.
+
+So why does Rust bother to invalidate `a`? Because if both `a` and `b` thought they were owners, both would try to free the heap allocation at the end of the scope. Free twice, crash. The "moved value" rule is exactly the rule that makes the double-free impossible.
+
+<Sidenote>
+A `String` on the stack is three words: a pointer to the heap, a length, and a capacity. The bytes live on the heap. A move copies the three words and marks the old name dead. The heap bytes do not move at all.
+</Sidenote>
+
+## But integers just copy. Why?
+
+Try the demo again with `i32`. Click the type toggle at the top. Now `let b = a` is harmless. Both `a` and `b` work. There is no error.
+
+What is different? An `i32` is small and lives entirely on the stack. There is no heap allocation behind it. There is nothing to "free" when it goes out of scope. Dropping an `i32` is a no-op.
+
+Rust calls this the **`Copy` trait**. A type is `Copy` if it has no destructor, that is, nothing to clean up when the value goes away. For `Copy` types, `let b = a` duplicates the bits and both names stay valid. There is no danger of a double-free because there is nothing to free.
+
+<Sidenote>
+The rule of thumb: simple stack types (`bool`, all the integer types, `char`, `f32`, `f64`, fixed-size arrays of `Copy` things) are `Copy`. Anything that owns a heap allocation or a resource (`String`, `Vec<T>`, `Box<T>`, `File`) is **not** `Copy`. Moves are reserved for the things that have real cleanup to do.
+</Sidenote>
+
+So now we have two kinds of types. Ones that move when you assign them, and ones that copy. The compiler knows the difference, and picks the right behavior for each.
+
+## I just want to peek at it
+
+Moves are great for ownership transfer. They are awful for everyday code. If every function I call swallows its argument, I will spend my whole life cloning things.
+
+```rust
+fn print_length(s: String) {
+    println!("{}", s.len());
+}
+
+let name = String::from("Omar");
+print_length(name);   // name is moved into the function
+print_length(name);   // error: name was moved on the line above
+```
+
+The fix is a **borrow**. Instead of handing the function the value, we hand it a reference. The function can read the value, the function does not own it, and when the function returns, the original variable is still valid.
+
+```rust
+fn print_length(s: &String) {     // & means "I borrow this"
+    println!("{}", s.len());
+}
+
+let name = String::from("Omar");
+print_length(&name);              // pass a reference
+print_length(&name);              // still works
+```
+
+A reference is a pointer that promises not to outlive the thing it points to. The compiler checks the promise for you. So far so good.
+
+But borrows have one famous rule that does most of the heavy lifting in Rust:
+
+> At any moment, you can have **either** any number of shared references (`&T`), **or** exactly one mutable reference (`&mut T`). Never both.
+
+This is the "shared XOR mutable" rule. Many readers, or one writer. Never both at the same time. If you try, the compiler stops you.
+
+You also see this rule written with the academic names: **aliasing XOR mutation**. *Aliasing* is the fact that more than one name points at the same data. *Mutation* is the ability to change the data through one of those names. Rust's rule is that you can have one or the other, but not both at the same place and time.
+
+```rust
+let mut x = 42;
+let r1 = &x;          // shared borrow, fine
+let r2 = &x;          // another shared borrow, also fine
+let m  = &mut x;      // error: cannot borrow `x` as mutable
+                      // because it is also borrowed as immutable
+```
+
+Why this rule? Because it makes whole categories of bugs impossible.
+
+If you have many readers and no writer, none of them can change the data. They all see the same value. No torn reads, no surprise.
+
+If you have one writer and no readers, nobody else is looking. The writer can change the data without telling anyone. No surprise either.
+
+The bug shows up only when readers and a writer share the same data. The reader sees the data change under it, and makes decisions based on a value that is no longer there. This is the heart of a data race in a multithreaded program. The "shared XOR mutable" rule prevents data races at compile time, on one thread or on a hundred, with no runtime check at all.
+
+<Sidenote>
+This is also why `Mutex` and `Arc` exist in Rust. They are how you opt back into "shared and mutable," safely, when you really need it. The lock guarantees that at any moment only one thread holds the mutable borrow.
+</Sidenote>
+
+## Why this matters
+
+So we have three rules. One value, one owner. Assignment moves, unless the type is `Copy`. References are shared XOR mutable.
+
+Together, these rules give us a remarkable property. **Memory safety, with no garbage collector, no reference counter on every value, and no runtime check at all.** The compiler proves the program is safe before it runs.
+
+## Next time: lifetimes
+
+There is one piece of the story we skipped. When a function returns a reference, the compiler needs to know which input it came from, so it can prove the reference does not outlive the data. This is what **lifetimes** are.
+We will tackle them next.
